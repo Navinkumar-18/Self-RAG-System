@@ -1,0 +1,151 @@
+import streamlit as st
+import faiss
+import numpy as np
+import requests
+from sentence_transformers import SentenceTransformer
+
+# ==============================
+# CONFIG
+# ==============================
+
+OLLAMA_MODEL = "llama3"   # Change to "phi" or "qwen" if you want
+
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# ==============================
+# SAMPLE DOCUMENTS
+# ==============================
+
+documents = [
+    "A vector database stores high-dimensional embeddings for similarity search.",
+    "LangChain is a framework for building applications using large language models.",
+    "Retrieval Augmented Generation retrieves relevant documents before generating answers.",
+    "FAISS is a library developed by Facebook AI for efficient similarity search.",
+    "Embeddings convert text into numerical vectors for semantic comparison."
+]
+
+doc_ids = [f"doc_{i}" for i in range(len(documents))]
+
+# Create embeddings
+doc_embeddings = embedding_model.encode(documents)
+dimension = doc_embeddings.shape[1]
+
+# FAISS index
+index = faiss.IndexFlatL2(dimension)
+index.add(np.array(doc_embeddings).astype("float32"))
+
+# ==============================
+# SESSION STATE INIT
+# ==============================
+
+if "doc_weights" not in st.session_state:
+    st.session_state.doc_weights = {doc_id: 1.0 for doc_id in doc_ids}
+
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = None
+
+# ==============================
+# RETRIEVAL FUNCTION
+# ==============================
+
+def retrieve(query, top_k=3):
+    query_embedding = embedding_model.encode([query])
+    D, I = index.search(np.array(query_embedding).astype("float32"), top_k)
+
+    results = []
+    for idx in I[0]:
+        doc_id = doc_ids[idx]
+        weight = st.session_state.doc_weights[doc_id]
+        results.append((doc_id, documents[idx], weight))
+
+    # Sort by weight (Self-Evolving ranking)
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results
+
+# ==============================
+# GENERATE ANSWER USING OLLAMA
+# ==============================
+
+def generate_answer(query, retrieved_docs):
+
+    context_text = "\n\n".join(
+        [f"{doc_id}: {content}" for doc_id, content, _ in retrieved_docs]
+    )
+
+    prompt = f"""
+You are an AI assistant inside a Self-Evolving RAG system.
+
+STRICT RULES:
+1. Answer ONLY using retrieved context.
+2. Do NOT use outside knowledge.
+3. If information is missing, say:
+   "The retrieved documents do not contain sufficient information."
+
+User Question:
+{query}
+
+Retrieved Context:
+{context_text}
+
+Final Answer:
+"""
+
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False
+        }
+    )
+
+    return response.json()["response"]
+
+# ==============================
+# STREAMLIT UI
+# ==============================
+
+st.title("🧠 Self-Evolving RAG System")
+
+query = st.text_input("Ask a question:")
+
+if st.button("Generate Answer") and query:
+
+    retrieved_docs = retrieve(query)
+    answer = generate_answer(query, retrieved_docs)
+
+    st.session_state.last_query = query
+    st.session_state.last_docs = retrieved_docs
+    st.session_state.last_answer = answer
+
+    st.subheader("Answer")
+    st.write(answer)
+
+    st.subheader("Retrieved Documents")
+    for doc_id, content, weight in retrieved_docs:
+        st.write(f"**{doc_id} (weight: {round(weight,2)})**")
+        st.write(content)
+        st.write("---")
+
+# ==============================
+# FEEDBACK SYSTEM
+# ==============================
+
+if st.session_state.last_answer:
+
+    col1, col2 = st.columns(2)
+
+    if col1.button("👍 Helpful"):
+        st.success("Great! System learns these docs are useful.")
+
+        for doc_id, _, _ in st.session_state.last_docs:
+            st.session_state.doc_weights[doc_id] += 0.1
+
+    if col2.button("👎 Not Helpful"):
+        st.warning("System updating rankings...")
+
+        for doc_id, _, _ in st.session_state.last_docs:
+            st.session_state.doc_weights[doc_id] -= 0.1
+
+    st.write("### Current Document Weights")
+    st.write(st.session_state.doc_weights)
